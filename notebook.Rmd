@@ -1,0 +1,805 @@
+---
+title: "R Notebook"
+output:
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+
+```{r}
+
+library(DESeq2)
+library(tidyverse)
+library(magrittr)
+library(readxl)
+library(limma)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(DescTools)
+library(EnhancedVolcano)
+#library(Rtsne)
+library(umap)
+library(dbscan)
+library(class)
+library(caTools)
+library(knitr)
+library(clusterProfiler)
+library(SingleCellExperiment)
+library(pheatmap)
+
+```
+
+Load in data from Nat Genetics pax5 paper
+
+```{r}
+#Read in HTseq files
+HTseq_files_dir_path <- file.path(getwd(),list.files()[3])
+sample_data <- read_excel(list.files()[2])
+sample_data_sorted <- sample_data %>%
+  arrange(patient) %>%
+  drop_na()
+sample_table <- data.frame(sampleName = sample_data_sorted$patient,
+                           sampleFiles = list.files(HTseq_files_dir_path),
+                           subtype = sample_data_sorted$`primary subtype`,
+                           batch = sample_data_sorted$`RNA-seq library`)
+sample_table$subtype <- factor(sample_table$subtype)
+sample_table$batch <- factor(sample_table$batch)
+
+#collapse subtypes into ASS1 defined groups as per previous ANOVA
+sample_table$ASS1_type <- fct_collapse(sample_table$subtype,
+                              ASS1_lo = c("ETV6-RUNX1","ETV6-RUNX1-like","Ph-like",
+                                          "High hyperdiploid"),
+                              ASS1_hi = c("Low hypodiploid","MEF2D","NUTM1","PAX5 P80R"),
+                              other_level = "ASS1_undefined")
+
+#generate deseq2 object
+dds_pax5 <- DESeqDataSetFromHTSeqCount(sampleTable = sample_table,
+                                       directory = HTseq_files_dir_path,
+                                       design = ~ batch + ASS1_type)
+```
+
+Do basic boxplot of ASS1 expression
+```{r}
+dds_pax5_vst <- vst(dds_pax5, blind = FALSE)
+
+ASS1_vst_counts <- assay(dds_pax5_vst[rownames(dds_pax5_vst) == "ENSG00000130707",])
+dds_pax5_vst$ASS1 <- as.vector(ASS1_vst_counts)
+ASS1_df <- data.frame(dds_pax5_vst$subtype, dds_pax5_vst$ASS1)
+names(ASS1_df) <- c("Subtype","ASS1")
+ASS1_bp <- ggplot(ASS1_df, aes(x = reorder(Subtype, ASS1), y = ASS1))
+
+fig_boxplot <- ASS1_bp + geom_boxplot(outlier.size = 0.25, lwd = 0.25, fatten = 0.25) + 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.25),
+        axis.ticks = element_line(colour = "black", linewidth = 0.25)) + 
+  ylab("ASS1 (vst transformed)") +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 9)) + 
+  theme(axis.text.y = element_text(size = 9),
+        axis.title.y = element_text(size = 9, face = 'plain')) +
+  geom_hline(yintercept = mean(ASS1_df$ASS1[ASS1_df$Subtype == "Other"]),
+             linetype = 'dotted', color = 'red')
+
+```
+
+Test for skewness of ASS1 distribution and re-do ANOVA
+```{r}
+ASS1_skewness_per_subgroup <- sapply(levels(as.factor(ASS1_df$Subtype)),
+                                     function(i){
+                                       skewness(ASS1_df$ASS1[ASS1_df$Subtype == i])})
+
+aov_model <- aov(ASS1 ~ Subtype, data = ASS1_df)
+aov_post_hoc <- DunnettTest(ASS1 ~ Subtype, data = ASS1_df, control = "Other")
+dunnett_table <- as.data.frame(aov_post_hoc$Other) %>% arrange(diff)
+#plot the results
+dunnet_volc <- EnhancedVolcano(dunnett_table,
+                lab = gsub("-Other","",rownames(dunnett_table)),
+                x = 'diff',
+                xlim = c(-2,2),
+                y = 'pval',
+                axisLabSize = 8,
+                pCutoff = 0.05,
+                FCcutoff = 0,
+                cutoffLineWidth = 0.1,
+                xlab = "Mean ASS1 difference c.f. control",
+                title = "",
+                subtitle = "",
+                pointSize = 1.0,
+                labSize = 2.0,
+                labCol = 'black',
+                drawConnectors = FALSE,
+                legendPosition = 'none',
+                gridlines.minor = FALSE,
+                gridlines.major = FALSE,
+                borderWidth = 0.25,
+                col = c("black","black","black","red"),
+                caption = ""
+                )
+dun_volc <- dunnet_volc +
+  theme(axis.ticks = element_line(size = 0.25)) +
+  theme(aspect.ratio=1) +
+  theme(text = element_text(size=8)) +
+  theme(plot.margin = margin(0,0,0,0, "mm"))
+
+```
+
+Reprocess the deseq2 object to annotate samples as per their ASS1 status from ANOVA
+```{r}
+
+#filter out non-ASS1 defined groups
+dds_ASS1 <- dds_pax5[,dds_pax5$ASS1_type != "ASS1_undefined"]
+dds_ASS1$ASS1_type <- factor(dds_ASS1$ASS1_type)
+
+#filter out lowly expressed genes
+keep <- rowSums(counts(dds_ASS1) >= 10) >= 100 #at least 100 samples with count >= 10
+dds_ASS1 <- dds_ASS1[keep,]
+
+#estimate library size for each sample
+dds_ASS1$lib_size <- as.vector(colSums(counts(dds_ASS1)))
+
+#remove records below the top 10 depth runs for each subtype
+dds_ASS1_keep_vec <- sapply(levels(factor(dds_ASS1$subtype)), function(i){
+  lib_size_vec <- dds_ASS1[,dds_ASS1$subtype == i]$lib_size
+  cutoff <- min(tail(sort(lib_size_vec),10))
+  keep_vec <- which(dds_ASS1$subtype == i & dds_ASS1$lib_size >= cutoff)
+})
+dds_ASS1_keep_vec <- sort(as.vector(unlist(dds_ASS1_keep_vec)))
+dds_ASS1_truncated <- dds_ASS1[,dds_ASS1_keep_vec]
+dds_ASS1_truncated$batch <- factor(dds_ASS1_truncated$batch)
+
+```
+
+Transform data using deseq2::vst to account for differences in library size and attempt batch correction depending on sequencing technology using limma::removebatcheffect
+```{r}
+dds_ASS1_truncated_vst <- vst(dds_ASS1_truncated, blind=FALSE)
+dds_ASS1_truncated_vst_BC <- dds_ASS1_truncated_vst #make separate variable so can compare PCA before and after batch correction
+
+mat <- assay(dds_ASS1_truncated_vst_BC)
+mm <- model.matrix(~ASS1_type, colData(dds_ASS1_truncated_vst_BC))
+mat <- limma::removeBatchEffect(mat, batch=dds_ASS1_truncated_vst_BC$batch, design=mm)
+assay(dds_ASS1_truncated_vst_BC) <- mat
+
+```
+
+PCA plots 
+```{r}
+pcaData_preBC <- plotPCA(dds_ASS1_truncated_vst, intgroup=c("batch", "ASS1_type"),
+                         returnData=TRUE)
+percentVar <- round(100 * attr(pcaData_preBC, "percentVar"))
+PCA_p <- ggplot(pcaData_preBC, aes(PC1, PC2, color=ASS1_type, shape=batch)) +
+  geom_point(size = 3) +
+  theme_bw() +
+  ylim(-60,50) + xlim(-70,80) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 14, face = 'plain')) +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14, face = 'plain')) +
+  coord_fixed()
+
+pcaData_BC <- plotPCA(dds_ASS1_truncated_vst_BC, intgroup=c("batch", "ASS1_type"),
+                         returnData=TRUE)
+percentVar_BC <- round(100 * attr(pcaData_BC, "percentVar"))
+PCA_BC_p <- ggplot(pcaData_BC, aes(PC1, PC2, color=ASS1_type, shape=batch)) +
+  geom_point(size = 3) +
+  theme_bw() + 
+  ylim(-60,50) + xlim(-70,80) +
+  xlab(paste0("PC1: ",percentVar_BC[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar_BC[2],"% variance")) + 
+  theme(axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 14, face = 'plain')) +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14, face = 'plain')) +
+  coord_fixed()
+
+```
+
+Do DEG analysis with top 80 samples using Wilcoxon test
+```{r}
+count_norm <- as.data.frame(assay(dds_ASS1_truncated_vst_BC))
+conditions <- factor(t(dds_ASS1_truncated_vst_BC$ASS1_type))
+
+pvalues <- sapply(1:nrow(count_norm),function(i){
+     data<-cbind.data.frame(gene=as.numeric(t(count_norm[i,])),conditions)
+     p=wilcox.test(gene~conditions, data)$p.value
+     return(p)
+   })
+fdr=p.adjust(pvalues,method = "fdr")
+
+conditionsLevel <- levels(conditions)
+dataCon1 = count_norm[,c(which(conditions==conditionsLevel[1]))]
+dataCon2 = count_norm[,c(which(conditions==conditionsLevel[2]))]
+foldChanges = log2(rowMeans(dataCon1)/rowMeans(dataCon2))
+
+outRst <- data.frame(log2foldChange=foldChanges, pValues=pvalues, FDR=fdr)
+rownames(outRst) = rownames(count_norm)
+outRst=na.omit(outRst)
+outRst <- outRst[outRst$FDR < 0.001,]
+outRst <- outRst[order(outRst$log2foldChange, decreasing = FALSE),]
+
+```
+
+Annotate the DEGs with symbols and ENTREZ IDs
+```{r}
+outRst$symbol <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = rownames(outRst),
+                                         column = "SYMBOL",
+                                         keytype = "ENSEMBL",
+                                         multiVals = "first")
+outRst$entrez <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = rownames(outRst),
+                                         column = "ENTREZID",
+                                         keytype = "ENSEMBL",
+                                         multiVals = "first")
+
+```
+
+Make a slightly stricter definition of regulated genes and remove rows without a gene symbol (usually pseudogenes or non-coding genes)
+```{r}
+outRst_strict <- outRst[outRst$FDR <0.001,] %>% drop_na()
+
+```
+
+Import network of regulated genes centred on ASS1 from STRING
+```{r}
+ASS1_network <- c("ACOX1","ADK","ADSS1","ASNS","AGMAT",
+                  "ALDH4A1","ASPDH","FAH","GLDC","GSN",
+                  "LDHB","PSAT1","PYCR1","SLC7A1","SRM",
+                  "ZNF169","COL5A1","CS","DPP3","EPRS1",
+                  "GLUL","GPT2","GSR","IDH3A","NOS2",
+                  "ODC1","PHGDH","PM20D1","ASS1") %>% sort()
+
+outRst_ASS1 <- outRst_strict[outRst_strict$symbol %in% ASS1_network,]
+
+```
+
+Do volcano plot for entire set
+```{r}
+outRst_all$symbol <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = rownames(outRst_all),
+                                         column = "SYMBOL",
+                                         keytype = "ENSEMBL",
+                                         multiVals = "first")
+
+all_DEG_volc <- EnhancedVolcano(outRst_all,
+                lab = paste0("italic('", outRst_all$symbol, "')"),
+                selectLab = "italic('ASS1')",
+                boxedLabels = TRUE,
+                parseLabels = TRUE,
+                drawConnectors = TRUE,
+                max.overlaps = Inf,
+                maxoverlapsConnectors = Inf,
+                min.segment.length = 0.4,
+                arrowheads = FALSE,
+                x = 'log2foldChange',
+                y = 'FDR',
+                axisLabSize = 8,
+                pCutoff = 0.001,
+                FCcutoff = 0,
+                xlab = "Log2FC",
+                xlim = c(-1,1.7),
+                ylim = c(0,15),
+                title = "",
+                subtitle = "",
+                pointSize = c(ifelse(outRst_all$symbol %in% c("ASS1"),2,0.2)),
+                labSize = 3.0,
+                labCol = 'black',
+                legendPosition = 'none',
+                gridlines.minor = FALSE,
+                gridlines.major = FALSE,
+                borderWidth = 0.25,
+                col = c("grey","grey","grey","red"),
+                caption = ""
+                )
+thesis_all_deg_volc <- all_DEG_volc + theme(axis.ticks = element_line(size = 0.25)) +
+  theme(text = element_text(size=12)) +
+  theme(plot.margin = margin(0,0,0,0, "mm")) +
+  coord_flip()
+
+```
+ORA
+```{r}
+ORA_list <- outRst$entrez
+ORA_list_down <- outRst$entrez[outRst$log2foldChange < 0]
+ORA_list_up <- outRst$entrez[outRst$log2foldChange > 0]
+m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+msig_ora_all <- enricher(ORA_list, TERM2GENE=m_t2g)
+msig_ora_down <- enricher(ORA_list_down, TERM2GENE=m_t2g)
+msig_ora_up <- enricher(ORA_list_up, TERM2GENE=m_t2g)
+
+GSEA_list <- outRst$log2foldChange %>%
+  magrittr::set_names(outRst$entrez) %>%
+  sort(decreasing = TRUE)
+msig_gsea <- GSEA(GSEA_list, TERM2GENE = m_t2g)
+
+```
+
+
+Make a heatmap from the ASS1 related 31 genes and cluster samples
+```{r}
+#cut down the vst transformed, batch corrected deseq2 object to the ASS1 gene network from STRING
+
+#make a matrix of transformed counts
+counts_pax5_heatmap <- assay(dds_ASS1_truncated_vst_BC)
+
+#reformat ASS1 related genes with ensembl ID
+ASS1_ensembl <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = ASS1_network,
+                                         column = "ENSEMBL",
+                                         keytype = "SYMBOL",
+                                         multiVals = "first")
+
+#filter counts matrix to include only ASS1 related genes
+counts_pax5_heatmap_ASS1 <- counts_pax5_heatmap[rownames(counts_pax5_heatmap) %in%
+                                                  ASS1_ensembl,]
+
+#build heatmap
+cut_sample_row_labels <- structure(names(ASS1_ensembl),
+                                   names = ASS1_ensembl)
+cut_sample_HM <- Heatmap(t(apply(counts_pax5_heatmap_ASS1,
+                                 MARGIN = 1,
+                                 function(x) x-median(x))),
+              row_labels = cut_sample_row_labels[rownames(counts_pax5_heatmap_ASS1)],
+              show_column_names = FALSE,
+              column_km = 2, column_km_repeats = 10)
+
+cut_sample_column_ann <- columnAnnotation(Subtype = dds_ASS1_truncated_vst_BC$subtype,
+                      col = list(
+                      Subtype = c("ETV6-RUNX1" = brewer.pal(n=8,
+                                                            name = "Paired")[1],
+                                  "ETV6-RUNX1-like" = brewer.pal(n=8,
+                                                                 name = "Paired")[2],
+                                    "High hyperdiploid" = brewer.pal(n=8,
+                                                                 name = "Paired")[3],
+                                    "Low hypodiploid" = brewer.pal(n=8,
+                                                                 name = "Paired")[4],
+                                    "MEF2D" = brewer.pal(n=8, name = "Paired")[5],
+                                    "NUTM1" = brewer.pal(n=8, name = "Paired")[6],
+                                    "PAX5 P80R" = brewer.pal(n=9,
+                                                             name = "Paired")[7],
+                                  "Ph-like" = brewer.pal(n=8, name = "Paired")[8])))
+
+```
+Make a new heatmap using the entire dataset
+```{r}
+#use the dds_pax5_vst object that was created to make the boxplots
+dds_pax5_vst_BC <- dds_pax5_vst
+counts_full_cohort_HM <- assay(dds_pax5_vst_BC)
+HM_mm <- model.matrix(~ASS1_type, colData(dds_pax5_vst_BC))
+counts_full_cohort_HM <- limma::removeBatchEffect(counts_full_cohort_HM,
+                                                batch = dds_pax5_vst_BC$batch,
+                                                design = HM_mm)
+assay(dds_pax5_vst_BC) <- counts_full_cohort_HM
+
+#repeat heatmap
+#filter counts matrix to include only ASS1 related genes
+counts_full_cohort_HM_ASS1 <- counts_full_cohort_HM[rownames(counts_full_cohort_HM) %in%
+                                                  as.vector(ASS1_ensembl),]
+
+#build heatmap
+full_cohort_row_labels <- structure(names(ASS1_ensembl),
+                                   names = ASS1_ensembl)
+full_cohort_HM <- Heatmap(t(apply(counts_full_cohort_HM_ASS1,
+                                 MARGIN = 1,
+                                 function(x) x-median(x))),
+              row_labels = full_cohort_row_labels[rownames(counts_full_cohort_HM_ASS1)],
+              show_column_names = FALSE,
+              column_split = umap_df$cluster)
+
+full_cohort_column_ann <- columnAnnotation(Subtype = dds_pax5_vst_BC$subtype)
+
+PAX5_HM_ANNO <- full_cohort_HM %v% full_cohort_column_ann
+
+```
+
+Do umap analysis using the ASS1 connected genes only
+```{r}
+u <- umap(t(counts_full_cohort_HM_ASS1))
+umap_df <- u$layout %>%
+  as.data.frame()%>%
+  rename(UMAP1="V1", UMAP2="V2") %>%
+  mutate(ID=row_number())
+
+umap_df$subtype <- dds_pax5_vst_BC$subtype
+```
+
+Assign clusters using dbscan
+```{r}
+umap_db_clust <- dbscan(umap_df[,1:2], eps = 0.3, minPts = 14)
+umap_df$cluster <- umap_db_clust$cluster
+
+#plot umap coloured by cluster
+umap_df %>%
+     ggplot(aes(x = UMAP1, y = UMAP2, color = factor(cluster))) +
+     geom_point(size = 3) +
+     scale_color_brewer(palette = "Paired") +
+     theme_void() + theme(legend.title = element_blank())
+
+cluster_groups <- count(umap_df, cluster, subtype)
+cluster_subtypes <- count(umap_df, subtype, cluster)
+
+```
+
+Plot breakdown of each subtype by cluster
+```{r echo=TRUE}
+cluster_subtypes %>%
+  ggplot(aes(fill = factor(cluster), y = n, x = subtype)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  scale_fill_brewer(palette = "Paired") +
+  theme_classic() +
+  scale_x_discrete(limits=legend_order$Subtype) +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 14)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1, suffix = "")) +
+  ylab("% subtype per cluster")
+
+```
+
+
+Replot umap coloured by subtype
+```{r}
+#make a tibble with subtypes, ordered by ASS1 mean to colour umap
+legend_order <- ASS1_df %>%
+  group_by(Subtype) %>%
+  summarise(ASS1_mean = mean(ASS1)) %>%
+  arrange(ASS1_mean)
+
+group_count <- length(unique(umap_df$subtype))
+subtype_colours[c(1,2,3,5,6,7,9,10,15,16)] <- colorRampPalette(brewer.pal(9,
+                                                              'Greens'))(30)[8:17]
+subtype_colours[4] <- "#FB9A99"
+subtype_colours[8] <- "#FF00FF"
+subtype_colours[11] <- "#CAB2D6"
+subtype_colours[12] <- "#FB9A99"
+subtype_colours[13] <- "#D3D3D3"
+subtype_colours[14] <- "#E31A1C"
+subtype_colours[c(17,18,20)] <- colorRampPalette(brewer.pal(9,
+                                                              'Blues'))(30)[21:24]
+subtype_colours[19] <- "#FDBF6F"
+subtype_colours[21] <- "#FDBF6F"
+subtype_colours[22] <- "#FF7F00"
+subtype_colours[23] <- "#33A02C"
+subtype_colours[24] <- "#FF7F00"
+names(subtype_colours) <- legend_order$Subtype
+subtype_colour_scale <- scale_color_manual(name = "subtype",
+                                           values = subtype_colours, breaks = legend_order$Subtype)
+
+umap_df %>%
+     ggplot(aes(x = UMAP1, y = UMAP2, color = subtype)) +
+     subtype_colour_scale +
+     geom_point(size = 3) +
+     theme_void() + theme(legend.title = element_blank()) + theme(legend.position = "bottom")
+
+```
+Pot umap coloured by ASS1
+```{r}
+umap_df$ASS1 <- scale(ASS1_df$ASS1)
+#mean_scaled_ass1_other <- mean(umap_df$ASS1[umap_df$subtype == "Other"])
+#max_scale <- max(umap_df$ASS1) + mean_scaled_ass1_other
+#min_scale <- (0-max(umap_df$ASS1)) + mean_scaled_ass1_other
+umap_df[umap_df$cluster != 0,] %>%
+     ggplot(aes(x = UMAP1, y = UMAP2, color = ASS1)) +
+     geom_point(size = 3) +
+     scale_color_distiller(palette = "RdBu",
+                           limit = max(abs(umap_df$ASS1)) * c(-1, 1),
+                           name = "ASS1-z") +
+     theme_void()
+
+```
+
+
+
+Look at basic ASS1 expression by cluster as boxplot, ordered as first boxplot
+```{r}
+ASS1_df_named_clustered_no_noise <- ASS1_df %>%
+  set_rownames(colnames(dds_pax5_vst)) %>%
+  mutate(cluster = umap_df$cluster) %>%
+  filter(cluster != 0)
+
+cluster_ASS1_bp <-  ggplot(ASS1_df_named_clustered_no_noise, aes(x = factor(reorder(cluster, ASS1)), y = ASS1))
+
+cluster_ASS1_bp  + geom_boxplot(outlier.size = 0.25, lwd = 0.25, fatten = 0.25) + 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.25),
+        axis.ticks = element_line(colour = "black", linewidth = 0.25)) + 
+  ylab("ASS1 (vst transformed)") +
+  xlab("Cluster") +
+  theme(axis.text.x = element_text(angle = 0, vjust = 1, hjust = 0.5, size = 9)) + 
+  theme(axis.text.y = element_text(size = 9),
+        axis.title.y = element_text(size = 9, face = 'plain'),
+        axis.title.x = element_text(size = 9, face = 'plain')) +
+  geom_hline(yintercept = mean(ASS1_df$ASS1[ASS1_df$Subtype == "Other"]),
+             linetype = 'dotted', color = 'red')
+
+
+```
+
+Find marker genes for ASS1 low cluster
+```{r}
+sce <- SingleCellExperiment(list(logcounts=counts_full_cohort_HM_ASS1))
+colLabels(sce) <- factor(umap_df$cluster)
+markers_clusters <- findMarkers(sce, test="wilcox", pval.type = "some")
+markers_cluster_2 <- markers_clusters[[3]]
+markers_cluster_2 <- markers_cluster_2[,colnames(markers_cluster_2)!="AUC.0"]
+markers_cluster_2 <- markers_cluster_2[markers_cluster_2$FDR <0.001,]
+AUCs <- getMarkerEffects(markers_cluster_2, prefix = "AUC")
+AUCs_keep <- sapply(1: length(AUCs[,1]), function(i) {keep[i] <- all(AUCs[i,] <0.5) || all(AUCs[i,] >0.5)})
+AUCs_conc <- AUCs[AUCs_keep,]
+#rename rows
+AUC_symbols <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = rownames(AUCs_conc),
+                                         column = "SYMBOL",
+                                         keytype = "ENSEMBL",
+                                         multiVals = "first")
+rownames(AUCs_conc) <- AUC_symbols
+ital_rownames <- lapply(
+  rownames(AUCs_conc),
+  function(x) bquote(italic(.(x))))
+
+markers_heatmap_AUC <- pheatmap(AUCs_conc, labels_row = as.expression(ital_rownames), angle_col = 0)
+
+```
+
+
+Project ECOG2993 data into UMAP - also do heatmap to compare to 40 vs 40 anova result
+```{r}
+#load("microarray_data.Rdata")
+
+ECOG2993_ASS1 <- gset_unique_trim[fData(gset_unique_trim)$symbol
+                                  %in% ASS1_network]
+
+ECOG2993_row_labels <- structure(fData(ECOG2993_ASS1)$symbol, names = rownames(ECOG2993_ASS1))
+
+ECOG2993_HM <- Heatmap(t(apply(exprs(ECOG2993_ASS1), MARGIN = 1, function(x) x - median(x))),
+                row_labels = ECOG2993_row_labels[rownames(exprs(ECOG2993_ASS1))],
+                row_names_gp = gpar(fontsize = 12, fontface = "italic"),
+                show_column_names = FALSE,
+                name = "log2FC",
+                column_split = cluster_classification_knn
+                )
+
+ECOG2993_col_anno <- columnAnnotation(Cyto = pData(ECOG2993_ASS1)$new_cyto,
+                            col = list(Cyto = c("BCR/ABL" = brewer.pal(n=9, name = "Paired")[1],
+                            "MLLr" = brewer.pal(n=9, name = "Paired")[2],
+                            "E2A/PBX1" = brewer.pal(n=9, name = "Paired")[3],
+                            "Control" = brewer.pal(n=9, name = "Paired")[4],
+                            "Neg" = brewer.pal(n=9, name = "Paired")[5],
+                            "TEL/AML" = brewer.pal(n=9, name = "Paired")[6],
+                            "Ph_like" = brewer.pal(n=9, name = "Paired")[9])))
+
+ECOG2993_HM_ANNO <- ECOG2993_HM %v% ECOG2993_col_anno
+
+
+
+```
+
+Z-transform both PAX5 and ECOG2993 data for classification purposes
+```{r}
+#assign symbols to ensembl rownames for the pax5 count matrix
+pax5_counts_forZ <- counts_full_cohort_HM_ASS1
+rownames(pax5_counts_forZ) <- full_cohort_row_labels[rownames(pax5_counts_forZ)]
+
+pax5_counts_Z <- scale(t(pax5_counts_forZ))
+
+
+ECOG2993_df <- as.data.frame(exprs(ECOG2993_ASS1),
+                             row.names = fData(ECOG2993_ASS1$symbol,
+                                               col.names = pData(ECOG2993_ASS1)$new_cyto))
+ECOG2993_df_Z <- scale(t(ECOG2993_df)) #the patient samples are now in rows, genes are columns
+
+#reorder columns of ECOG2993_df_Z to match PAX5
+ECOG2993_df_Z <- ECOG2993_df_Z[,match(colnames(pax5_counts_Z),colnames(ECOG2993_df_Z))]
+
+#remove rows in pax5 data that were assigned as noise by dbscan
+pax5_counts_Z <- pax5_counts_Z[(umap_df$cluster != 0),]
+
+```
+
+Ph-L reclassification validation
+```{r}
+Ph_L_genes <- c("SPATS2L","MUC4","CRLF2","CA6","NRXN3","BMPR1B","CHN2","SEMA6A","PON2","SLC2A5","S100Z","TP53INP1","IFITM1")
+
+ECOG2993_Ph_L <- gset_unique_trim[fData(gset_unique_trim)$symbol
+                                  %in% Ph_L_genes]
+ECOG2993_Ph_L_Z <- scale(t(exprs(ECOG2993_Ph_L)))
+
+
+
+Ph_L_ensembl <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = Ph_L_genes,
+                                         column = "ENSEMBL",
+                                         keytype = "SYMBOL",
+                                         multiVals = "first")
+counts_full_cohort_HM_Ph <- counts_full_cohort_HM[rownames(counts_full_cohort_HM) %in%
+                                                  as.vector(Ph_L_ensembl),]
+Ph_L_counts_forZ <- counts_full_cohort_HM_Ph
+rownames(Ph_L_counts_forZ) <- full_cohort_row_labels[rownames(Ph_L_counts_forZ)]
+Ph_L_counts_Z <- scale(t(Ph_L_counts_forZ))
+
+cluster_classification_knn_ph_l <- knn(train = Ph_L_counts_Z,
+                                  test = ECOG2993_Ph_L_Z,
+                                  cl = dds_pax5_vst$subtype,
+                                  k = 107)
+
+knn_summary_table_ph <- table(ECOG2993_Ph_L$new_cyto, cluster_classification_knn_ph_l)
+
+
+```
+
+
+
+Do k-nearest neighbours classification with marker genes only
+```{r}
+#define mrker genes by ensembl codes
+AUC_ensembl <- AnnotationDbi::mapIds(org.Hs.eg.db,
+                                         keys = AUC_symbols,
+                                         column = "ENSEMBL",
+                                         keytype = "SYMBOL",
+                                         multiVals = "first")
+
+#start with pax5 data
+counts_full_cohort_HM_cluster_2_marker <- counts_full_cohort_HM[rownames(counts_full_cohort_HM) %in%
+                                                  as.vector(AUC_ensembl),]
+#assign symbols to ensembl rownames for the pax5 count matrix
+pax5_counts_forZ <- counts_full_cohort_HM_cluster_2_marker
+rownames(pax5_counts_forZ) <- full_cohort_row_labels[rownames(pax5_counts_forZ)]
+pax5_counts_Z <- scale(t(pax5_counts_forZ))
+
+# now the ECOG data
+ECOG2993_markers <- gset_unique_trim[fData(gset_unique_trim)$symbol
+                                  %in% AUC_symbols]
+ECOG2993_df <- as.data.frame(exprs(ECOG2993_markers),
+                             row.names = fData(ECOG2993_markers)$symbol,
+                             col.names = pData(ECOG2993_markers)$new_cyto)
+ECOG2993_df_Z <- scale(t(ECOG2993_df)) #the patient samples are now in rows, genes are columns
+
+#reorder columns of ECOG2993_df_Z to match PAX5
+ECOG2993_df_Z <- ECOG2993_df_Z[,match(colnames(pax5_counts_Z),colnames(ECOG2993_df_Z))]
+
+#remove rows in pax5 data that were assigned as noise by dbscan
+pax5_counts_Z <- pax5_counts_Z[(umap_df$cluster != 0),]
+
+
+cluster_class <- factor(umap_df$cluster[umap_df$cluster != 0])
+
+cluster_classification_knn <- knn(train = pax5_counts_Z,
+                                  test = ECOG2993_df_Z,
+                                  cl = cluster_class,
+                                  k = 71)
+
+knn_summary_table <- table(ECOG2993_markers$new_cyto, cluster_classification_knn)
+#write.csv(knn_summary_table,
+#          file = "knn_summary_table.csv",
+#          sep = ",",
+#          quote = FALSE,
+#          row.names = rownames(knn_summary_table),
+#          col.names = colnames(knn_summary_table))
+```
+
+Iterate knn over range of k to determine best
+```{r}
+knn_iterate <- t(sapply(1:100, function(i) {
+                  knn_step <- knn(train = pax5_counts_Z,
+                                          test = ECOG2993_df_Z,
+                                          cl = cluster_class,
+                                          k = ((2*i)-1))
+                  k_step <- ((2*i)-1)
+                  accuracy_step <- 1 - (mean(knn_step != cluster_classk))
+                  c(k_step, accuracy_step)
+                  })) %>%
+  set_colnames(c("k","Accuracy"))
+
+
+```
+
+Plot knn results
+```{r}
+knn_df <- data.frame(Subtype = ECOG2993_markers$new_cyto,
+                     Cluster = as.integer(cluster_classification_knn))
+knn_df <- count(knn_df, Subtype, Cluster)
+
+colours_knn <- brewer.pal(n = 11, name = 'Paired')
+level_order <- c("Ph_like", "BCR/ABL", "E2A/PBX1", "Neg", "MLLr")
+
+knn_df %>%
+  filter(Subtype %in% level_order) %>%
+  ggplot(aes(fill = factor(Cluster), y = n, x = factor(Subtype, level = level_order))) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  scale_fill_manual(values = colours_knn[c(2:8)]) +
+  theme_classic() +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 14)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1, suffix = "")) +
+  ylab("% subtype per cluster")
+
+
+
+```
+
+ECOG clustered ASS1
+```{r}
+ECOG_df_named_clustered <- t(ECOG2993_df) %>%
+  as.data.frame() %>%
+  select("ASS1") %>%
+  mutate(Cluster = cluster_classification_knn, Subtype= ECOG2993_markers$new_cyto)
+
+cluster_ECOG_bp <-  ggplot(ECOG_df_named_clustered, aes(x = factor(reorder(Cluster, ASS1)), y = ASS1))
+
+cluster_ECOG_bp  + geom_boxplot(outlier.size = 0.25, lwd = 0.25, fatten = 0.25) + 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.25),
+        axis.ticks = element_line(colour = "black", linewidth = 0.25)) + 
+  ylab("ASS1 (log transformed)") +
+  xlab("Cluster") +
+  theme(axis.text.x = element_text(angle = 0, vjust = 1, hjust = 0.5, size = 12)) + 
+  theme(axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12, face = 'plain'),
+        axis.title.x = element_text(size = 12, face = 'plain')) +
+  geom_hline(yintercept = mean(ECOG_df_named_clustered$ASS1[ECOG_df_named_clustered$Subtype == "Neg"]),
+             linetype = 'dotted', color = 'red')
+
+```
+
+
+Below are unused chunks for reference only
+```{r}
+#Do DEG analysis with increased iterations
+
+#need to remove factor levels for samples that have been cutoff
+
+#dds_ASS1_truncated <- estimateSizeFactors(dds_ASS1_truncated)
+#dds_ASS1_truncated <- estimateDispersions(dds_ASS1_truncated)
+#dds_ASS1_truncated <- nbinomWaldTest(dds_ASS1_truncated, maxit=500)
+
+```
+
+Do t-SNE analysis
+```{r}
+#tsne_fit <- Rtsne(t(counts_full_cohort_HM_ASS1), perplexity = 80, verbose = TRUE)
+#tsne_df <- tsne_fit$Y %>% 
+#  as.data.frame() %>%
+#  rename(tSNE1="V1",
+#         tSNE2="V2") %>%
+#  mutate(ID=row_number())
+#tsne_df$subtype <- dds_pax5_vst_BC$subtype
+
+#tsne_df %>%
+#  ggplot(aes(x = tSNE1, 
+#             y = tSNE2,
+#             color = subtype))+
+#  geom_point()+
+#  theme(legend.position="bottom")
+
+```
+
+Look at results
+```{r}
+#res_lo_vs_hi <- results(dds_ASS1, contrast = c("ASS1_type","ASS1_lo","ASS1_hi"),
+#                        cooksCutoff = FALSE)
+#res_lo_vs_hi <- data.frame(res_lo_vs_hi) %>%
+#  arrange(log2FoldChange)
+
+```
+
+Look at results for deeper read depth samples
+```{r}
+#res_lo_vs_hi2 <- results(dds_ASS1_deep, contrast = c("ASS1_type","ASS1_lo","ASS1_hi"),
+#                        cooksCutoff = FALSE)
+#res_lo_vs_hi2 <- data.frame(res_lo_vs_hi) %>%
+#  arrange(log2FoldChange)
+
+```
